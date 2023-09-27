@@ -3,6 +3,7 @@
 // For Rotary Encoder
 #include "AiEsp32RotaryEncoder.h"
 #include "Arduino.h"
+#include <arduino-timer.h>
 
 // Rotary encoder defines
 #define ROTARY_ENCODER_A_PIN 19
@@ -11,61 +12,211 @@
 #define ROTARY_ENCODER_VCC_PIN -1
 #define ROTARY_ENCODER_STEPS 4
 
+// System states
+#define WAITING 0
+#define COUNTING 1
+#define PAUSED 2
+#define BUZZING 3
+
 // Buzzer pin
 #define BUZZER_PIN 17
 #define CHANNEL 0
 
+// Globals
+auto timer = timer_create_default();
+
+// System states
+int state           = WAITING;
+int hours           = 0;
+int minutes         = 0;
+int seconds         = 60;
+int rotary_input    = 0;
+int time_changed    = true;
+bool new_text       = true;
+bool button_pressed = false;
+static unsigned long lastTimePressed = 0;  // for debouncing
+
 LiquidCrystal_I2C lcd(0x27, 16, 2);  // set the LCD address to 0x3F for a 16 chars and 2 line display
 AiEsp32RotaryEncoder rotaryEncoder = AiEsp32RotaryEncoder(ROTARY_ENCODER_A_PIN, ROTARY_ENCODER_B_PIN, ROTARY_ENCODER_BUTTON_PIN, ROTARY_ENCODER_VCC_PIN, ROTARY_ENCODER_STEPS);
 
-/* For Rotary encoder */
-void rotary_onButtonClick() {
-  static unsigned long lastTimePressed = 0;  // Soft debouncing
+void IRAM_ATTR readEncoderISR() {
+  rotaryEncoder.readEncoder_ISR();
+}
+
+void alarm() {
+  ledcWriteTone(CHANNEL, 600);  // Generate a 1000 Hz tone
+  delay(1000);                  // Wait for 1 second
+  ledcWriteTone(CHANNEL, 0);    // Stop the tone
+  delay(1000);                  // Wait for 1 second
+}
+
+void poll_rotary_input() {
+  if (rotaryEncoder.encoderChanged()) {
+    time_changed = true;
+    rotary_input = rotaryEncoder.readEncoder() ;
+  }
+}
+
+void set_hours_minutes() {
+  hours = rotary_input / 60;
+  minutes = rotary_input % 60;
+}
+
+void display_waiting_message() {
+  if (new_text) {
+    lcd.setCursor(0, 0);
+    lcd.print("Timer duration: ");
+    new_text = false;
+  }
+  display_time();
+}
+
+void display_counting_message() {
+  if (new_text) {
+    lcd.setCursor(0, 0);
+    lcd.print("Time remaining: ");
+    new_text = false;
+  }
+  display_time();
+}
+
+void display_paused_message() {
+  if (new_text) {
+    lcd.setCursor(0, 0);
+    lcd.print("Paused          ");
+    new_text = false;
+  }
+  display_time();
+}
+
+void display_time() {
+  // If the time hasn't changed, then just return
+  if (!time_changed)  {
+    return;
+  }
+  else {
+    // Display hours
+    lcd.setCursor(0, 1);
+    if (hours == 0) {
+      lcd.print("00");
+      lcd.print(" hour  ");
+    } else if (hours == 1) {
+      lcd.print("0");
+      lcd.print(hours);
+      lcd.print(" hour  ");
+    } else if (hours < 10) {
+      lcd.print("0");
+      lcd.print(hours);  // print num hours
+      lcd.print(" hours ");
+    } else {
+      lcd.print(hours);
+      lcd.print(" hours ");
+    }
+
+    // Display minutes
+    if (minutes == 0) {
+      lcd.print("00");
+      lcd.print(" mins");
+    } else if (minutes == 1) {
+      lcd.print("0");
+      lcd.print(minutes);
+      lcd.print(" min ");
+    }
+    else if (minutes < 10) {
+      lcd.print("0");
+      lcd.print(minutes);
+      lcd.print(" mins");
+    } else {
+      lcd.print(minutes);
+      lcd.print(" mins");
+    }
+    // Once we've updated the time, reset the time_changed variable
+    time_changed = false;
+  }
+}
+
+void rotary_encoder_button_ISR() {
   if (millis() - lastTimePressed < 500) {
     return;
   }
   lastTimePressed = millis();
-  Serial.print("button pressed ");
-  Serial.print(millis());
-  Serial.println(" milliseconds after restart");
+  button_pressed = true;
 }
 
-void rotary_loop() {
-  //dont print anything unless value changed
-  if (rotaryEncoder.encoderChanged()) {
-    Serial.print("Value: ");
-    Serial.println(rotaryEncoder.readEncoder());  
+bool every_minute(void *) {
+  time_changed = true;
+  // Decrement minutes
+  minutes --;
+  // If there is still an hour on the clock, then decrement hours and reset
+  // minute
+  if (minutes <= -1 && hours > 0) {
+    hours --;
+    minutes = 59;
   }
-  if (rotaryEncoder.isEncoderButtonClicked()) {
-    rotary_onButtonClick();
-  }
+  return true;
 }
 
-bool get_rotary_button_input() {
-  if (rotaryEncoder.isEncoderButtonClicked()) {
-    rotary_onButtonClick();
-    return true;
-  }
+bool end_timer(void *) {
+  state = BUZZING;
+  timer.cancel();
   return false;
 }
 
-int get_rotary_input() {
-  //dont print anything unless value changed
-  Serial.print("Rotary input: ");
-  int value = rotaryEncoder.readEncoder();
-  int hours = int(value) / 60;
-  int minutes = int(value) % 60;
-  Serial.print(value);
-  Serial.print(" hours: ");
-  Serial.print(hours);
-  Serial.print(" minutes: ");
-  Serial.println(minutes);
+void handle_button_push() {
+  if (button_pressed) {
+    // If the button has been pressed, and we are in the WAITING state, and the 
+    // user has entered positive time, then change to the COUNTING state
+    if (state == WAITING && hours + minutes > 0) {
+      set_hours_minutes();  // Determine the parameters of the timer
+      unsigned long millis = (hours * 60 * 60 * 1000) + (minutes * 60 * 1000);
+      timer.in(millis, end_timer);
 
-  return value;
+      state = COUNTING; // Change system state
+      new_text = true;  // new text will need to be displayed when we change
+                        // states
+    } else if (state == COUNTING) {
+      state = PAUSED; // If we are already counting and the button has been 
+      new_text = true;// pressed, change to the PAUSED state
+    } else if (state == PAUSED) {
+      state = COUNTING;// If we are paused and the button is pressed, change to 
+      new_text = true; // COUNTING state
+    } else if (state == BUZZING) {
+      state = WAITING; // If buzzing and the button is pressed, change 
+      new_text = true; // back to WAITING
+    }
+    // There is one small case which one of these cases address, and that is
+    // the case that they press the button and there is no time on the clock.
+    // In that case, we do nothing, and simply wait for them to put positive
+    // time on the clock.
+    button_pressed = false; // After we have handled all the cases,
+                            // lower the flag.
+  }
+
 }
 
-void IRAM_ATTR readEncoderISR() {
-  rotaryEncoder.readEncoder_ISR();
+void handle_system_state() {
+  // Check system state and do what needs to be done for that state.
+  if (state == WAITING) {
+    // In this state we want to just wait for the user to press the button
+    // for the first time after they've entered a valid input
+    poll_rotary_input();
+    // and update the screen according to the time
+    set_hours_minutes();
+    display_waiting_message();
+  } else if (state == COUNTING) {
+    // If we are in the counting state, then we simply want to advance the timer
+    timer.tick();
+    // and update the screen
+    display_counting_message();
+  } else if (state == PAUSED) {
+    // If the timer has been paused, then we will not advance the timer, and
+    // instead we do nothing but show a "Paused" message
+    display_paused_message();
+  } else if (state == BUZZING) {
+    // If the timer is now buzzing, we will just buzz and wait for them to 
+    // press the button, which will reset the timer.
+    alarm();  // buzz the alarm
+  }
 }
 
 void setup() {
@@ -73,13 +224,6 @@ void setup() {
   lcd.init();
   lcd.clear();
   lcd.backlight();  // Make sure backlight is on
-
-  // Print a message on both lines of the LCD.
-  // lcd.setCursor(2, 0);  //Set cursor to character 2 on line 0
-  // lcd.print("Hello world!");
-
-  // lcd.setCursor(2, 1);  //Move cursor to character 2 on line 1
-  // lcd.print("LCD Tutorial");
 
   /* For rotary encoder */
   Serial.begin(115200);
@@ -93,134 +237,24 @@ void setup() {
   // which is 1439 minutes
   rotaryEncoder.setBoundaries(0, 1439, circleValues);  //minValue, maxValue, circleValues true|false (when max go to min and vice versa)
 
-  /*Rotary acceleration introduced 25.2.2021.
-  * in case range to select is huge, for example - select a value between 0 and 1000 and we want 785
-  * without accelerateion you need long time to get to that number
-  * Using acceleration, faster you turn, faster will the value raise.
-  * For fine tuning slow down.
-  */
   //rotaryEncoder.disableAcceleration(); //acceleration is now enabled by default - disable if you dont need it
   rotaryEncoder.setAcceleration(250);  //or set the value - larger number = more accelearation; 0 or 1 means disabled acceleration
 
   // Set up buzzer
   ledcSetup(CHANNEL, 5000, 8);         // Setup LEDC channel with a frequency of 5000Hz and 8-bit resolution
   ledcAttachPin(BUZZER_PIN, CHANNEL);  // Attach the buzzer pin to the LEDC channel
+
+  // Enable interrupt for rotary encoder button
+  attachInterrupt(ROTARY_ENCODER_BUTTON_PIN, rotary_encoder_button_ISR, RISING);
+
+  // Setup timer
+  timer.every(60000, every_minute); // update the timer every minute
+
+  // Display opening message
+  display_waiting_message();
 }
 
-void display_time(int hours, int minutes) {
-  // Display hours
-  lcd.setCursor(0, 1);  // beginning of row 2
-  lcd.print("  ");
-  lcd.setCursor(0, 1);
-  if (hours == 0) {
-    lcd.print("00");
-  }
-  else if (hours < 10) {
-    lcd.print("0");
-    lcd.print(hours);     // print num hours
-  }
-  else {
-    lcd.print(hours);
-  }
-  lcd.print(" hours");
-
-  // Display minutes
-  lcd.setCursor(9, 1);
-  lcd.print("  ");
-  lcd.setCursor(9, 1);
-  if (minutes == 0) {
-    lcd.print("00");
-  }
-  else if (minutes < 10) {
-    lcd.print("0");
-    lcd.print(minutes);
-  }
-  else {
-    lcd.print(minutes);
-  }
-  lcd.print(" mins");
-  
-}
-
-// Declare input value from  user
-int input = 0;
 void loop() {
-  /* Step 1: Display a prompt asking for time */
-  lcd.setCursor(0, 0);
-  lcd.print("Timer duration:");
-  if (rotaryEncoder.encoderChanged()) {
-    input = get_rotary_input();
-  }
-
-  int hours = input / 60;
-  int minutes = input % 60;
-
-  // Display time that they choose
-  display_time(hours, minutes);
-  
-  // Proceed only if time is on the clock
-  if (hours + minutes > 0) {
-    /* Start timer if button was pressed */
-    if (get_rotary_button_input()) {
-      int seconds = 0;  // even though user won't see seconds, we need to keep
-      // track of them as they add up to minutes
-
-      // Start timer
-      // Clear LCD for new text
-      lcd.clear();
-      bool time_expired = false;
-      // Count down until the timer has expired, but pause when they press
-      // the pause button
-      while (!time_expired) {
-        // Display remaining time
-        lcd.print("Time remaining:");
-        display_time(hours, minutes); // display time remaining
-        bool paused = get_rotary_button_input();
-        if (paused) {
-          lcd.clear();
-          lcd.print("  Timer paused");
-          display_time(hours, minutes);
-          while (paused) {
-            paused = get_rotary_button_input(); // wait til unpaused
-          }
-          // Display time remaining again after timer has been un-paused
-          lcd.clear();
-          lcd.print("Time remaining:");
-          display_time(hours, minutes);
-        }
-        // Otherwise, countdown if there is time remaining on the clock
-        else if (hours + minutes > 0){
-          // decrement the timer by one second
-          delay(950);
-          seconds ++;
-          // While counting down, check if hours or minutes need to be 
-          // decremented
-          if (seconds >= 60) {
-            minutes --;
-            seconds = 0;
-            if (minutes <= 0 && hours >= 1) {
-              hours --;
-              minutes = 59;
-            }
-          }
-        }
-        // If no time is remaining, then sound the buzzer and wait for button 
-        // press to stop the buzzer
-        else {
-          time_expired = true;
-          bool alarm = true;
-          while (alarm){
-            ledcWriteTone(CHANNEL, 600);  // Generate a 1000 Hz tone
-            delay(1000);                  // Wait for 1 second
-            alarm = !get_rotary_button_input();
-            ledcWriteTone(CHANNEL, 0);    // Stop the tone
-            delay(1000);                  // Wait for 1 second
-            alarm = !get_rotary_button_input();  // We check twice because they
-            // might press the button at any time
-          }
-          lcd.clear();  // clear the display in preparation for new screen
-        }
-      }
-    }
-  }
+  handle_button_push();
+  handle_system_state();
 }
